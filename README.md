@@ -32,3 +32,29 @@ The system operates across three primary components:
 ```bash
 git clone [https://github.com/DevangM03/python-tcp-load-balancer.git](https://github.com/DevangM03/python-tcp-load-balancer.git)
 cd python-tcp-load-balancer
+```
+
+**2. Start the Server Nodes:**
+Open multiple terminal instances to simulate a distributed environment. Run a server instance in each:
+```bash
+python server.py
+```
+*(Note: Ensure you configure different ports if running on the same machine, or rely on the script's default dynamic port allocation if implemented).*
+
+**3. Start the Load Balancer:**
+In a new terminal, initialize the load balancer so it can start accepting server registrations and client traffic:
+```bash
+python load_balancer.py
+```
+
+**4. Run the Client:**
+Finally, spin up one or more clients to send traffic through the load balancer:
+```bash
+python client.py
+```
+
+## 🔮 Future Enhancements
+
+* Implementation of **Health Checks** (Heartbeats) to dynamically drop disconnected or failing server nodes from the routing pool.
+* Addition of alternative load balancing algorithms, such as **Least Connections** or **Weighted Round-Robin**.
+* Implementing persistent storage for the key-value store using write-ahead logs (WAL).
