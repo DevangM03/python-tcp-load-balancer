@@ -52,9 +52,3 @@ Finally, spin up one or more clients to send traffic through the load balancer:
 ```bash
 python client.py
 ```
-
-## 🔮 Future Enhancements
-
-* Implementation of **Health Checks** (Heartbeats) to dynamically drop disconnected or failing server nodes from the routing pool.
-* Addition of alternative load balancing algorithms, such as **Least Connections** or **Weighted Round-Robin**.
-* Implementing persistent storage for the key-value store using write-ahead logs (WAL).
