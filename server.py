@@ -1,6 +1,13 @@
-import socket
-import threading
+import asyncio
+import logging
+import sys
 from typing import Optional, List, Generic, TypeVar
+
+# Configure high-performance logging infrastructure
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] Data-Engine: %(message)s"
+)
 
 K = TypeVar('K')
 V = TypeVar('V')
@@ -15,95 +22,97 @@ class HashMap(Generic[K, V]):
         self.INITIAL_CAPACITY = initial_capacity
         self.buckets: List[List[KeyValuePair[K, V]]] = [[] for _ in range(self.INITIAL_CAPACITY)]
         self.size = 0
-        # RLock is used because put() recursively calls _resize(), which also needs the lock.
-        self.lock = threading.RLock()
+        
+        # NOTE: threading.RLock is completely removed. 
+        # In a single-threaded async event loop, synchronous operations are naturally atomic.
 
     def _get_bucket_index(self, key: K) -> int:
-        hash_code = hash(key)
-        return abs(hash_code) % len(self.buckets)
+        return abs(hash(key)) % len(self.buckets)
 
     def put(self, key: K, value: V) -> None:
-        with self.lock:
-            index = self._get_bucket_index(key)
-            bucket = self.buckets[index]
+        index = self._get_bucket_index(key)
+        bucket = self.buckets[index]
 
-            # Check if key already exists
-            for entry in bucket:
-                if entry.key == key:
-                    entry.value = value
-                    return
+        # Key overwrite mutation scan
+        for entry in bucket:
+            if entry.key == key:
+                entry.value = value
+                return
 
-            # Add new entry
-            bucket.append(KeyValuePair(key, value))
-            self.size += 1
+        # Handle hash collisions smoothly using separate chaining
+        bucket.append(KeyValuePair(key, value))
+        self.size += 1
 
-            # Resize if load factor exceeds 0.75
-            if self.size / len(self.buckets) > 0.75:
-                self._resize()
+        # Evaluate load factor density; dynamically rehash if bounds cross the 0.75 threshold
+        if self.size / len(self.buckets) > 0.75:
+            self._resize()
 
     def get(self, key: K) -> Optional[V]:
-        with self.lock:
-            index = self._get_bucket_index(key)
-            bucket = self.buckets[index]
+        index = self._get_bucket_index(key)
+        bucket = self.buckets[index]
 
-            for entry in bucket:
-                if entry.key == key:
-                    return entry.value
-            return None
+        for entry in bucket:
+            if entry.key == key:
+                return entry.value
+        return None
 
     def get_or_default(self, key: K, default_value: V) -> V:
-        with self.lock:
-            value = self.get(key)
-            return value if value is not None else default_value
+        value = self.get(key)
+        return value if value is not None else default_value
 
     def remove(self, key: K) -> Optional[V]:
-        with self.lock:
-            index = self._get_bucket_index(key)
-            bucket = self.buckets[index]
+        index = self._get_bucket_index(key)
+        bucket = self.buckets[index]
 
-            for i, entry in enumerate(bucket):
-                if entry.key == key:
-                    removed_entry = bucket.pop(i)
-                    self.size -= 1
-                    return removed_entry.value
-            return None
+        for i, entry in enumerate(bucket):
+            if entry.key == key:
+                removed_entry = bucket.pop(i)
+                self.size -= 1
+                return removed_entry.value
+        return None
 
     def _resize(self) -> None:
-        with self.lock:
-            old_buckets = self.buckets
-            self.buckets = [[] for _ in range(len(self.buckets) * 2)]
-            self.size = 0
+        """Executes global bucket rehashing. Time Complexity: O(N) amortized."""
+        old_buckets = self.buckets
+        self.buckets = [[] for _ in range(len(self.buckets) * 2)]
+        self.size = 0
 
-            for bucket in old_buckets:
-                for entry in bucket:
-                    self.put(entry.key, entry.value)
+        for bucket in old_buckets:
+            for entry in bucket:
+                self.put(entry.key, entry.value)
 
     def get_size(self) -> int:
-        with self.lock:
-            return self.size
+        return self.size
 
-class Server:
-    def __init__(self, port: int = 12345):
+
+class AsyncServer:
+    def __init__(self, port: int = 12345, lb_host: str = '127.0.0.1', lb_port: int = 8888):
         self.PORT = port
+        self.LB_HOST = lb_host
+        self.LB_PORT = lb_port
         self.data_store = HashMap[str, str]()
 
-    def handle_client(self, client_socket: socket.socket, client_address: tuple):
+    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """Processes atomic, line-terminated data commands inside non-blocking network streams."""
+        client_address = writer.get_extra_info('peername')
         try:
-            print(f"Client connected: {client_address}")
-            
             while True:
-                # Read request type
-                request_type = client_socket.recv(1024).decode().strip()
-                if not request_type or request_type == "QUIT":
+                # Read incoming data chunks up to the newline character delimiter (\n)
+                data = await reader.readline()
+                if not data:
                     break
                 
-                print(f"Received request: {request_type}")
-                response = "Invalid request type"
+                payload = data.decode().strip()
+                if payload == "QUIT" or not payload:
+                    break
                 
-                # Symmetrically handles both REMOVE and DELETE aliases to support resume text mappings
-                if request_type in ["GET", "REMOVE", "DELETE"]:
-                    key = client_socket.recv(1024).decode().strip()
-                    
+                # Parse single-line message framing (e.g., PUT:key:value or GET:key)
+                parts = payload.split(":", 2)
+                request_type = parts[0].upper()
+                response = "Invalid request format"
+
+                if request_type in ["GET", "REMOVE", "DELETE"] and len(parts) >= 2:
+                    key = parts[1]
                     if request_type == "GET":
                         response = self.data_store.get_or_default(key, "Key not found")
                     else:
@@ -111,64 +120,58 @@ class Server:
                             response = f"{request_type} operation successful"
                         else:
                             response = f"Key not found for {request_type} operation"
-                        
-                elif request_type == "PUT":
-                    key = client_socket.recv(1024).decode().strip()
-                    value = client_socket.recv(1024).decode().strip()
+
+                elif request_type == "PUT" and len(parts) == 3:
+                    key, value = parts[1], parts[2]
                     self.data_store.put(key, value)
                     response = "PUT operation successful"
-                
-                # Send back payload response
-                client_socket.send(f"{response}\n".encode())
-                
-        except Exception as e:
-            print(f"Error handling client {client_address}: {e}")
-        finally:
-            client_socket.close()
 
-    def start(self):
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
-        try:
-            server_socket.bind(('localhost', self.PORT))
-            server_socket.listen(1024)
-            print(f"Server listening on port {self.PORT}")
-            
-            # --- Automatic Server Registration Protocol ---
-            try:
-                reg_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                reg_socket.connect(('localhost', 8888))
-                reg_socket.send(f"REGISTER:{self.PORT}\n".encode())
-                reg_socket.close()
-                print(f"Successfully registered node on port {self.PORT} with Load Balancer.")
-            except Exception as e:
-                print(f"Discovery Alert: Could not register with Load Balancer: {e}")
-            # -----------------------------------------------
-            
-            while True:
-                client_socket, client_address = server_socket.accept()
-                client_thread = threading.Thread(
-                    target=self.handle_client, 
-                    args=(client_socket, client_address)
-                )
-                client_thread.daemon = True
-                client_thread.start()
-                
+                # Write line-terminated payload frame back down the socket pipeline
+                writer.write(f"{response}\n".encode())
+                await writer.drain()
+
         except Exception as e:
-            print(f"Server error: {e}")
+            logging.error(f"Error handling transactions for client {client_address}: {e}")
         finally:
-            server_socket.close()
+            writer.close()
+            await writer.wait_closed()
+
+    async def start(self):
+        """Binds asynchronous socket servers and executes automatic discovery hooks."""
+        # Initialize the non-blocking network socket infrastructure
+        server = await asyncio.start_server(
+            self.handle_client, 
+            '127.0.0.1', 
+            self.PORT,
+            backlog=8192 # Expand kernel accept backlog queue to smoothly absorb connection bursts
+        )
+        logging.info(f"Storage Server active on port {self.PORT}")
+
+        # --- High-Performance Asynchronous Server Registration Hook ---
+        try:
+            reg_reader, reg_writer = await asyncio.open_connection(self.LB_HOST, self.LB_PORT)
+            reg_writer.write(f"REGISTER:{self.PORT}\n".encode())
+            await reg_writer.drain()
+            reg_writer.close()
+            await reg_writer.wait_closed()
+            logging.info(f"Discovery: Registered port {self.PORT} securely with Load Balancer.")
+        except Exception as e:
+            logging.error(f"Discovery Alert: Gateway registration handshake failed: {e}")
+        # -------------------------------------------------------------
+
+        async with server:
+            await server.serve_forever()
+
 
 if __name__ == "__main__":
-    import sys
-    
-    port = 12345  # default port
+    server_port = 12345
     if len(sys.argv) > 1:
         try:
-            port = int(sys.argv[1])
+            server_port = int(sys.argv[1])
         except ValueError:
-            print("Invalid port number, using default port 12345")
-    
-    server = Server(port)
-    server.start()
+            logging.warning("Invalid port provided, reverting to default 12345")
+
+    try:
+        asyncio.run(AsyncServer(port=server_port).start())
+    except KeyboardInterrupt:
+        logging.info("Storage node shutting down cleanly.")
