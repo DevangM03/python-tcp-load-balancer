@@ -1,0 +1,41 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Component: Load Balancer",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/load_balancer.py",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Component: Server 12345",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/server.py",
+            "args": ["12345"],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Component: Server 12346",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/server.py",
+            "args": ["12346"],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ],
+    "compounds": [
+        {
+            "name": "🚀 Launch Distributed Cluster",
+            "configurations": [
+                "Component: Load Balancer",
+                "Component: Server 12345",
+                "Component: Server 12346"
+            ]
+        }
+    ]
+}
