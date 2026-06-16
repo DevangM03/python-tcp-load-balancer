@@ -1,87 +1,126 @@
-import socket
-import time
+import asyncio
+import sys
+import logging
 
-class Client:
+# Configure production-grade client logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] Client-Engine: %(message)s"
+)
+
+class AsyncClient:
     def __init__(self, server_ip: str = "127.0.0.1", lb_port: int = 8888):
         self.SERVER_IP = server_ip
         self.LB_PORT = lb_port
 
-    def fetch_server_port(self) -> int:
-        """Fetches an active storage destination node assignment from the load balancer."""
-        lb_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        lb_socket.connect((self.SERVER_IP, self.LB_PORT))
+    async def fetch_server_port(self) -> int:
+        """Asynchronously contacts the load balancer to lease an active storage node port."""
+        reader, writer = await asyncio.open_connection(self.SERVER_IP, self.LB_PORT)
         
-        # Identity payload handshake signaling client routing traffic
-        lb_socket.send("CLIENT_REQUEST\n".encode())
+        # Dispatch gateway broker handshake routing token
+        writer.write(b"CLIENT_REQUEST\n")
+        await writer.drain()
         
-        response = lb_socket.recv(1024).decode().strip()
-        lb_socket.close()
+        data = await reader.readline()
+        response = data.decode().strip()
+        
+        writer.close()
+        await writer.wait_closed()
         
         if response.startswith("ERROR"):
             raise RuntimeError(response)
         return int(response)
 
-    def start(self):
-        server_socket = None
+    async def execute_transaction(self, op: str, key: str, value: str = "") -> str:
+        """One-off transaction runner—used primarily by high-concurrency automated drivers."""
+        try:
+            server_port = await self.fetch_server_port()
+            reader, writer = await asyncio.open_connection(self.SERVER_IP, server_port)
+            
+            # Pack transaction into a single atomic application frame
+            payload = f"{op}:{key}:{value}\n" if op == "PUT" else f"{op}:{key}\n"
+            writer.write(payload.encode())
+            await writer.drain()
+            
+            data = await reader.readline()
+            response = data.decode().strip()
+            
+            writer.write(b"QUIT\n")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            return response
+        except Exception as e:
+            return f"TRANSACTION_ERROR: {e}"
+
+    async def start_interactive_session(self):
+        """Launches a long-lived, non-blocking interactive shell wrapper."""
         max_retries = 3
+        reader, writer = None, None
         
-        # Robust network retry fallback execution loop
         for attempt in range(max_retries):
             try:
-                print(f"Routing request to load balancer (Attempt {attempt + 1}/{max_retries})...")
-                server_port = self.fetch_server_port()
+                logging.info(f"Leasing target node from Load Balancer (Attempt {attempt + 1}/{max_retries})...")
+                server_port = await self.fetch_server_port()
                 
-                print(f"Establishing direct connection session with node port: {server_port}")
-                server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                server_socket.connect((self.SERVER_IP, server_port))
-                print(f"Session safely bonded with Server Node: {server_port}")
+                logging.info(f"Opening direct persistent stream channel with node on port {server_port}...")
+                reader, writer = await asyncio.open_connection(self.SERVER_IP, server_port)
+                logging.info(f"Session successfully bonded with Storage Server Node: {server_port}")
                 break
-                
-            except (ConnectionRefusedError, socket.timeout, RuntimeError) as e:
-                print(f"Graceful Node Recovery: Failed to reach assigned server node ({e}). Fetching alternative target...")
-                time.sleep(1)
+            except (asyncio.TimeoutError, ConnectionRefusedError, OSError, RuntimeError) as e:
+                logging.warning(f"Node Recovery Loop: Server node unreached ({e}). Re-routing...")
+                await asyncio.sleep(1)
         else:
-            print("System Failure Alert: Failed to connect to any backend storage services.")
+            logging.error("Fatal Cluster Alert: Infrastructure completely unreachable.")
             return
 
         try:
+            # Run loops using standard non-blocking system input lookups wrapped concurrently
+            loop = asyncio.get_event_loop()
             while True:
-                # Symmetrically maps interaction inputs to the execution requirements of the backend store
                 print("\nChoose operation (GET, PUT, REMOVE, DELETE) or 'QUIT' to exit:")
-                operation = input().upper()
+                # Offload blocking terminal input to an isolated executor to keep the event loop spinning
+                operation = (await loop.run_in_executor(None, input)).upper().strip()
                 
                 if operation == "QUIT":
-                    server_socket.send("QUIT\n".encode())
+                    writer.write(b"QUIT\n")
+                    await writer.drain()
                     break
-                
+                    
                 if operation not in ["GET", "PUT", "REMOVE", "DELETE"]:
                     print("Invalid operation selection.")
                     continue
                 
-                server_socket.send(f"{operation}\n".encode())
+                print("Enter key:")
+                key = (await loop.run_in_executor(None, input)).strip()
                 
-                if operation in ["GET", "REMOVE", "DELETE"]:
-                    print("Enter key:")
-                    key = input()
-                    server_socket.send(f"{key}\n".encode())
-                    
-                elif operation == "PUT":
-                    print("Enter key:")
-                    key = input()
+                # Compress properties down into a single application frame
+                if operation == "PUT":
                     print("Enter value:")
-                    value = input()
-                    server_socket.send(f"{key}\n".encode())
-                    server_socket.send(f"{value}\n".encode())
+                    value = (await loop.run_in_executor(None, input)).strip()
+                    payload = f"PUT:{key}:{value}\n"
+                else:
+                    payload = f"{operation}:{key}\n"
                 
-                response = server_socket.recv(1024).decode().strip()
-                print(f"Server response: {response}")
+                # Send atomic message payload downstream
+                writer.write(payload.encode())
+                await writer.drain()
                 
-            server_socket.close()
-            print("Client session disconnected cleanly.")
-            
+                data = await reader.readline()
+                print(f"Server response: {data.decode().strip()}")
+                
         except Exception as e:
-            print(f"Fatal exception during runtime data streaming: {e}")
+            logging.error(f"Fatal error during runtime data stream multiplexing: {e}")
+        finally:
+            if writer:
+                writer.close()
+                await writer.wait_closed()
+                logging.info("Client stream session disconnected cleanly.")
 
 if __name__ == "__main__":
-    client = Client()
-    client.start()
+    client = AsyncClient()
+    # Execute an interactive loop session safely inside the event loop engine context
+    try:
+        asyncio.run(client.start_interactive_session())
+    except KeyboardInterrupt:
+        logging.info("Interactive client engine exited cleanly.")
